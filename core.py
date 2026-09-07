@@ -151,9 +151,19 @@ def extract_invoice(pdf_bytes: bytes, buyer=None) -> dict:
 
     t = collapse(_pdf_text(pdf_bytes))
     d = {"so_hd": None, "so_tien": None, "vat": 0, "web": "", "ma_tra_cuu": "",
-         "mst_ban": "", "dia_chi_mua": "", "dia_chi_ok": False, "ngay": None, "loai": "X"}
+         "mst_ban": "", "dia_chi_mua": "", "dia_chi_ok": False, "ngay": None,
+         "loai": "X", "is_hotel": False, "so_dem": None}
     if not t:
         return d
+
+    # ----- khách sạn / nhà nghỉ? -----
+    if re.search(r"thuê\s*phòng|phòng\s*nghỉ|lưu\s*trú|khách\s*sạn|nhà\s*nghỉ|homestay|motel|hotel",
+                 t, re.I):
+        d["is_hotel"] = True
+        d["loai"] = "KS"
+        m = re.search(r"\bĐêm\s+(\d{1,2})\b", t) or re.search(r"phòng[^0-9]{0,30}?(\d{1,2})\s*đêm", t, re.I)
+        if m:
+            d["so_dem"] = int(m.group(1))
 
     m = (re.search(r"Số\s*\(No\)?\s*:\s*(\d{5,10})", t)
          or re.search(r"Ký hiệu[^0-9]{0,20}?Số:\s*(\d{5,10})", t)
@@ -161,23 +171,32 @@ def extract_invoice(pdf_bytes: bytes, buyer=None) -> dict:
     if m:
         d["so_hd"] = m.group(1)
 
-    m = re.search(r"[Tt]ra cứu hóa đơn[^:]*tại:\s*(https?://[^\s,)]+|[a-z0-9.\-]+\.vn)", t)
+    m = (re.search(r"[Tt]ra cứu[^:]*tại[^:]*:\s*(https?://[^\s,)]+|[a-z0-9.\-]+\.vn)", t)
+         or re.search(r"[Ww]ebsite tra cứu[^:]*:\s*(https?://[^\s,)]+|[a-z0-9.\-]+\.vn)", t))
     if m:
         d["web"] = tidy_url(m.group(1))
-    m = re.search(r"[Mm]ã tra cứu[^:]*:\s*([A-Za-z0-9\-]+)", t)
+    m = re.search(r"[Mm]ã tra cứu[^:]*:\s*([A-Za-z0-9_\-]+)", t)
     if m:
         d["ma_tra_cuu"] = m.group(1)
 
-    m = re.search(r"Đơn vị bán hàng[^:]*:\s*(.+?)\s*Mã số thuế[^:]*:\s*(\d{10,13})", t)
-    if m:
-        d["mst_ban"] = m.group(2)
+    if d["is_hotel"]:
+        m = (re.search(r"Căn cước công dân\s*:\s*(\d{9,13})", t)
+             or re.search(r"MST\s*/?\s*CCCD[^:]*:\s*(\d{9,13})", t))
+        if m and m.group(1) != mst_mua:
+            d["mst_ban"] = m.group(1)
     else:
-        m = re.search(r"(SƠN HẢI|XĂNG DẦU[^0-9]{0,40})\s*(\d{10})", t)
+        m = re.search(r"Đơn vị bán hàng[^:]*:\s*(.+?)\s*Mã số thuế[^:]*:\s*(\d{10,13})", t)
         if m:
             d["mst_ban"] = m.group(2)
+        else:
+            m = re.search(r"(SƠN HẢI|XĂNG DẦU[^0-9]{0,40})\s*(\d{10})", t)
+            if m:
+                d["mst_ban"] = m.group(2)
 
-    kkknt = "KKKNT" in t
+    kkknt = "KKKNT" in t or "KKKNT" in t.replace(" ", "")
     m = (re.search(r"Tổng cộng tiền thanh toán[^:]*:\s*([\d.]+)", t)
+         or re.search(r"Tổng số tiền thanh toán[^:]*:\s*([\d.]+)", t)
+         or re.search(r"Cộng tiền bán hàng[^:]*:\s*([\d.]+)", t)      # hóa đơn bán hàng (khách sạn)
          or re.search(r"Cộng tiền hàng[^:]*:\s*([\d.]+)", t))
     if m:
         d["so_tien"] = parse_money(m.group(1))
@@ -192,9 +211,10 @@ def extract_invoice(pdf_bytes: bytes, buyer=None) -> dict:
         except ValueError:
             pass
 
-    m = re.search(r"(Xăng|Dầu)\s+[^\n]{0,40}?(Lít|Kg|lít|kg)\b", t, re.I)
-    if m:
-        d["loai"] = "D" if m.group(1)[0].lower() == "d" else "X"
+    if not d["is_hotel"]:
+        m = re.search(r"(Xăng|Dầu)\s+[^\n]{0,40}?(Lít|Kg|lít|kg)\b", t, re.I)
+        if m:
+            d["loai"] = "D" if m.group(1)[0].lower() == "d" else "X"
 
     # địa chỉ người mua: khối "Tầng N ... Việt Nam" (bên bán là cây xăng, không mở đầu "Tầng")
     m = re.search(r"(Tầng\s*\d+[^\n]{5,120}?(?:Việt\s*Nam|Vietnam)\.?)", t, re.I)
@@ -209,11 +229,11 @@ def extract_invoice(pdf_bytes: bytes, buyer=None) -> dict:
     return d
 
 
-def eml_invoice_no(eml_bytes: bytes):
+def _eml_text(eml_bytes: bytes):
     try:
         m = email.message_from_bytes(eml_bytes)
     except Exception:
-        return None
+        return "", ""
     subj = str(email.header.make_header(email.header.decode_header(m.get("Subject", ""))))
     body = ""
     for p in m.walk():
@@ -223,14 +243,41 @@ def eml_invoice_no(eml_bytes: bytes):
                     p.get_content_charset() or "utf-8", errors="replace")
             except Exception:
                 pass
-    text = html.unescape(re.sub(r"<[^>]+>", " ", body))
-    for pat in (r"[Ss]ố hóa đơn[:\s]*0*(\d{5,10})",
-                r"[Hh]óa đơn điện tử số[:\s]*0*(\d{5,10})",
-                r"Số[:\s]*0*(\d{6,10})"):
+    return subj, collapse(html.unescape(re.sub(r"<[^>]+>", " ", body)))
+
+
+def eml_invoice_no(eml_bytes: bytes):
+    subj, text = _eml_text(eml_bytes)
+    for pat in (r"[Ss]ố hóa đơn[:\s]*(\d{4,10})",
+                r"[Hh]óa đơn điện tử số[:\s]*(\d{4,10})",
+                r"gửi hóa đơn[^0-9]{0,20}số\s*(\d{4,10})",
+                r"\bSố[:\s]*(\d{5,10})\b"):
         mm = re.search(pat, subj + " " + text)
         if mm:
             return mm.group(1)
     return None
+
+
+def eml_info(eml_bytes: bytes) -> dict:
+    """Rút số HĐ + mã tra cứu + website từ EML (dùng khi PDF là ảnh không có chữ)."""
+    subj, text = _eml_text(eml_bytes)
+    both = subj + " " + text
+    d = {"so_hd": eml_invoice_no(eml_bytes), "ma_tra_cuu": "", "web": "", "is_hotel": None}
+    m = re.search(r"[Mm]ã\s*(?:số|tra cứu)[^:]{0,12}[:\s]+([A-Za-z0-9_\-*]{6,})", both)
+    if m:
+        d["ma_tra_cuu"] = m.group(1)
+    m = re.search(r"(https?://[a-z0-9.\-]+(?:tra-cuu|invoice|hoadon)[a-z0-9./\-]*)", both, re.I)
+    if m:
+        d["web"] = tidy_url(m.group(1))
+    elif re.search(r"petrolimex", both, re.I):
+        d["web"] = "https://hoadon.petrolimex.com.vn/"
+    elif re.search(r"meinvoice|misa", both, re.I):
+        d["web"] = "https://www.meinvoice.vn/tra-cuu"
+    if re.search(r"petrolimex|xăng|dầu", both, re.I):
+        d["is_hotel"] = False
+    elif re.search(r"phòng nghỉ|khách sạn|nhà nghỉ", both, re.I):
+        d["is_hotel"] = True
+    return d
 
 
 # ------------------------------ KM từ Numbers -----------------------------------
@@ -587,4 +634,391 @@ def build_full_zip(result: "Result", invoice_files: list) -> bytes:
         for old, new in result.renamed:
             if old in by_name:
                 z.writestr(f"Hóa đơn/{new}", by_name[old])
+    return buf.getvalue()
+
+
+# ============================================================================
+# ===================  CHẾ ĐỘ NHIỀU CHUYẾN / CÓ LƯU TRÚ  ======================
+# ============================================================================
+
+def _strip_diacritics(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s or "")
+                   if unicodedata.category(c) != "Mn").replace("đ", "d").replace("Đ", "D")
+
+
+@dataclass
+class Trip:
+    dia_diem: str
+    tu: dt.date
+    den: dt.date
+    so_dem: int = 0
+    km: float = 0.0
+
+    @property
+    def range_str(self):
+        return f"{self.tu:%d/%m/%Y} - {self.den:%d/%m/%Y}"
+
+
+@dataclass
+class Layout:
+    # DNTT
+    dntt_desc_row0: int          # dòng diễn giải đầu (thường 10)
+    dntt_n_desc: int             # số dòng diễn giải (1 hoặc 2)
+    dntt_total_row: int          # dòng "Tổng cộng/ Total:"
+    dntt_inv_row0: int           # dòng hóa đơn đầu trong "Bảng kê chứng từ"
+    dntt_inv_slots: int          # số dòng hóa đơn tối đa
+    dntt_sum_row: int
+    # Bảng kê chi tiết
+    bk_sheet: str
+    bk_trip_row0: int
+    bk_trip_slots: int
+    bk_claim_row0: int
+    bk_claim_slots: int
+    bk_claim_total_row: int
+    bk_h3: str = "H3"
+    hotel_rate: int = 500_000
+    pd_rate: int = 200_000
+    bk_tong_cp_cell: str = "H25"
+    bk_tam_ung_cell: str = "H23"
+    bk_muc_dich_cell: str = "C4"
+    # Tra cứu HĐ
+    tc_sheet: str = "Tra cứu HĐ"
+    tc_row0: int = 3
+    requestor: str = ""
+
+
+def _find_row(ws, col, needle, r1=1, r2=60):
+    nl = needle.lower()
+    for r in range(r1, r2):
+        v = ws[f"{col}{r}"].value
+        if v is not None and nl in str(v).lower():
+            return r
+    return None
+
+
+def detect_layout(wb) -> Layout:
+    dn = wb["DNTT"]
+    bk_name = next(s for s in wb.sheetnames if s.strip() == "Bảng kê chi tiết")
+    bk = wb[bk_name]
+    tc_name = next((s for s in wb.sheetnames if s.strip() == "Tra cứu HĐ"), "Tra cứu HĐ")
+
+    # --- DNTT: khối trên ---
+    r_stt = _find_row(dn, "A", "STT", 1, 15) or 9
+    desc0 = r_stt + 1
+    total_row = _find_row(dn, "A", "Tổng cộng", desc0, desc0 + 8) or (desc0 + 1)
+    n_desc = max(1, total_row - desc0)
+
+    # --- DNTT: bảng kê chứng từ ---
+    r_bk = _find_row(dn, "A", "BẢNG KÊ CHỨNG TỪ", 15, 40)
+    hdr = (_find_row(dn, "A", "STT", r_bk + 1, r_bk + 5) if r_bk else None) or (r_bk + 2 if r_bk else 26)
+    inv0 = hdr + 2                       # có 1 dòng phụ đề "(chưa VAT)" ở giữa
+    sum_row = None
+    for r in range(inv0, inv0 + 40):
+        g = dn[f"G{r}"].value
+        if isinstance(g, str) and g.replace(" ", "").upper().startswith("=SUM(G"):
+            sum_row = r
+            break
+    if sum_row is None:
+        sum_row = inv0 + 7
+    slots = sum_row - inv0
+
+    # --- Bảng kê chi tiết ---
+    r_dd = _find_row(bk, "B", "Địa điểm công tác", 1, 12) or 5
+    trip0 = r_dd + 2
+    r_tong = _find_row(bk, "D", "Tổng:", trip0, trip0 + 15) or (trip0 + 6)
+    trip_slots = max(1, r_tong - trip0)
+
+    r_claim_hdr = _find_row(bk, "B", "(No.)", r_tong, r_tong + 6) or (r_tong + 3)
+    claim0 = r_claim_hdr + 1
+    r_claim_total = _find_row(bk, "B", "Tổng cộng (Total)", claim0, claim0 + 15) or (claim0 + 6)
+    claim_slots = max(1, r_claim_total - claim0)
+
+    r_tongcp = _find_row(bk, "E", "Tổng chi phí", r_claim_total, r_claim_total + 5) or (r_claim_total + 1)
+    r_tamung = _find_row(bk, "E", "Tạm ứng", r_tongcp, r_tongcp + 4) or (r_tongcp + 1)
+    r_mucdich = _find_row(bk, "B", "Mục đích công tác", 1, 8) or 4
+
+    # định mức
+    def _rate(label, default):
+        rr = _find_row(bk, "H", label, 4, 10)
+        if rr:
+            for col in ("I", "J", "K"):
+                v = bk[f"{col}{rr}"].value
+                if isinstance(v, (int, float)) and v > 1000:
+                    return int(v)
+        return default
+    hotel_rate = _rate("Khách sạn", 500_000)
+    pd_rate = _rate("Per-diem", 200_000)
+
+    h3 = "H3" if isinstance(bk["H3"].value, str) and "Thời gian" in str(bk["H3"].value) else \
+         (f"H{_find_row(bk, 'H', 'Thời gian/ Time', 1, 6) or 3}")
+
+    return Layout(
+        dntt_desc_row0=desc0, dntt_n_desc=n_desc, dntt_total_row=total_row,
+        dntt_inv_row0=inv0, dntt_inv_slots=slots, dntt_sum_row=sum_row,
+        bk_sheet=bk_name, bk_trip_row0=trip0, bk_trip_slots=trip_slots,
+        bk_claim_row0=claim0, bk_claim_slots=claim_slots, bk_claim_total_row=r_claim_total,
+        bk_h3=h3, hotel_rate=hotel_rate, pd_rate=pd_rate,
+        bk_tong_cp_cell=f"H{r_tongcp}", bk_tam_ung_cell=f"H{r_tamung}",
+        bk_muc_dich_cell=f"C{r_mucdich}",
+        tc_sheet=tc_name, tc_row0=(_find_row(wb[tc_name], "B", "Loại HĐ", 1, 6) or 2) + 1,
+        requestor=str(dn["D5"].value or "").strip(),
+    )
+
+
+def _match_hotel_trip(ngay, trips):
+    """Khớp hóa đơn KS với chuyến CÓ NGỦ LẠI: chọn chuyến ngắn nhất chứa ngày;
+    nếu không có, chọn chuyến ngủ lại gần ngày nhất."""
+    overnight = [(i, t) for i, t in enumerate(trips) if t.so_dem > 0] or list(enumerate(trips))
+    if ngay:
+        chua = [(i, t) for i, t in overnight
+                if t.tu - dt.timedelta(days=1) <= ngay <= t.den + dt.timedelta(days=1)]
+        if chua:
+            return min(chua, key=lambda it: (it[1].den - it[1].tu).days)[0]
+        return min(overnight,
+                   key=lambda it: min(abs((ngay - it[1].tu).days), abs((ngay - it[1].den).days)))[0]
+    return overnight[0][0]
+
+
+def generate_multi(template_bytes: bytes,
+                   invoice_files: list,
+                   cfg: Config,
+                   trips: list,               # list[Trip]  (đã parse)
+                   gas_rows: list,             # [{so_hd, so_tien, chuyen}]  user nhập
+                   khu_vuc: str = "") -> Result:
+    """Chế độ nhiều chuyến / có lưu trú."""
+    R = Result()
+    err = R.errors.append; warn = R.warnings.append; log = R.log.append
+
+    if not template_bytes:
+        err("Chưa upload file Excel mẫu.")
+    if not trips:
+        err("Chưa nhập chuyến công tác nào.")
+    for i, tr in enumerate(trips, 1):
+        if not tr.dia_diem or not tr.tu or not tr.den:
+            err(f"Chuyến {i}: thiếu địa điểm / ngày.")
+        elif tr.den < tr.tu:
+            err(f"Chuyến {i}: 'đến ngày' sớm hơn 'từ ngày'.")
+    if R.errors:
+        return R
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
+        L = detect_layout(wb)
+    except Exception as ex:
+        err(f"Không đọc được file Excel mẫu: {ex}")
+        return R
+
+    # --- đọc hóa đơn ---
+    pdfs = [(n, b) for n, b in invoice_files if n.lower().endswith(".pdf")]
+    emls = [(n, b) for n, b in invoice_files if n.lower().endswith(".eml")]
+    pdf_by_no = {}       # so_hd(lstrip0) -> info
+    for name, b in pdfs:
+        inv = extract_invoice(b, cfg.buyer)
+        so = inv["so_hd"]
+        if so:
+            pdf_by_no[so.lstrip("0") or so] = inv
+            pre = "HĐKS" if inv["is_hotel"] else ("HĐD" if inv["loai"] == "D" else "HĐX")
+            mark = "" if inv["dia_chi_ok"] else " [SAI ĐỊA CHỈ]"
+            R.renamed.append((name, f"{pre}_{so}{mark}.pdf"))
+            if not inv["dia_chi_ok"]:
+                warn(f"HĐ {so}: địa chỉ người mua chưa khớp — thấy “{inv['dia_chi_mua'] or 'không tìm thấy'}”.")
+    eml_by_no = {}
+    for name, b in emls:
+        info = eml_info(b)
+        so = (info.get("so_hd") or "").lstrip("0")
+        if so:
+            eml_by_no[so] = info
+
+    # --- KHÁCH SẠN: từ PDF, tự khớp chuyến ---
+    hotel_lines = []
+    for key, inv in pdf_by_no.items():
+        if not inv["is_hotel"]:
+            continue
+        ti = _match_hotel_trip(inv["ngay"], trips)
+        tr = trips[ti]
+        hotel_lines.append({
+            "so_hd": inv["so_hd"], "loai_hd": "HĐKS",
+            "mota": f"Chi phí khách sạn {tr.range_str}",
+            "chua_vat": int(round((inv["so_tien"] or 0) - (inv["vat"] or 0))),
+            "vat": int(round(inv["vat"] or 0)),
+            "thanh_toan": int(round(inv["so_tien"] or 0)),
+            "web": inv["web"] or "https://www.meinvoice.vn/tra-cuu",
+            "ma_tra_cuu": inv["ma_tra_cuu"], "mst_ban": inv["mst_ban"],
+            "trip_idx": ti, "is_last": False,
+        })
+    if not hotel_lines:
+        warn("Không thấy hóa đơn khách sạn nào trong file upload.")
+    hotel_lines.sort(key=lambda h: h["trip_idx"])
+
+    # --- XĂNG: từ bảng user nhập ---
+    gas_lines = []
+    for g in gas_rows:
+        so = re.sub(r"\D", "", str(g.get("so_hd") or ""))
+        tien = parse_money(g.get("so_tien"))
+        if not so or tien is None:
+            continue
+        ch = g.get("chuyen")
+        try:
+            ti = int(ch) - 1
+        except (TypeError, ValueError):
+            ti = None
+        if ti is None or not (0 <= ti < len(trips)):
+            ti = len(gas_lines) % len(trips)     # rải đều nếu không ghi chuyến
+        key = so.lstrip("0") or so
+        pdf = pdf_by_no.get(key)
+        eml = eml_by_no.get(key)
+        web = (pdf and pdf["web"]) or (eml and eml.get("web")) or ""
+        ma = (pdf and pdf["ma_tra_cuu"]) or (eml and eml.get("ma_tra_cuu")) or ""
+        mst = (pdf and pdf["mst_ban"]) or ""
+        loai_hd = "HĐD" if (pdf and pdf["loai"] == "D") else "HĐX"
+        vat = int(round(pdf["vat"])) if (pdf and pdf["vat"]) else 0
+        tr = trips[ti]
+        gas_lines.append({
+            "so_hd": so, "loai_hd": loai_hd,
+            "mota": f"Chi phí {tr.dia_diem}: {tr.range_str}",
+            "chua_vat": tien - vat, "vat": vat, "thanh_toan": tien,
+            "web": web, "ma_tra_cuu": ma, "mst_ban": mst,
+            "trip_idx": ti, "is_last": False,
+        })
+    if not gas_lines:
+        err("Chưa nhập hóa đơn xăng nào (bảng 'Số tiền hóa đơn xăng').")
+        return R
+    gas_lines.sort(key=lambda x: (x["trip_idx"], x["so_hd"]))
+
+    # --- tính tiền ---
+    total_km = sum(t.km for t in trips)
+    if total_km <= 0:
+        err("Tổng KM = 0. Nhập KM cho các chuyến.")
+        return R
+    R.km = total_km
+    R.km_source = "nhập tay (theo chuyến)"
+    R.tien_di_lai = mileage_amount(total_km)
+
+    # xăng: chỉnh hóa đơn CUỐI cho tổng = tiền đi lại theo KM (giống chế độ đơn giản)
+    goc_last = gas_lines[-1]["thanh_toan"]
+    tong_khac = sum(g["thanh_toan"] for g in gas_lines[:-1])
+    can_co = int(round(R.tien_di_lai - tong_khac))
+    if can_co < 0:
+        err(f"Các hóa đơn xăng TRƯỚC hóa đơn cuối ({tong_khac:,.0f}) đã vượt tiền đi lại theo KM "
+            f"({R.tien_di_lai:,.0f}). Bớt hóa đơn hoặc kiểm tra KM.")
+        return R
+    if can_co < goc_last:
+        gas_lines[-1]["thanh_toan"] = can_co
+        gas_lines[-1]["chua_vat"] = can_co - gas_lines[-1]["vat"]
+        log(f"Hóa đơn xăng cuối HĐ {gas_lines[-1]['so_hd']}: {goc_last:,.0f} → {can_co:,.0f} (chỉnh cho khớp KM).")
+    elif can_co > goc_last:
+        R.thieu = can_co - goc_last
+        warn(f"THIẾU HÓA ĐƠN XĂNG: còn thiếu {R.thieu:,.0f}đ so với tiền đi lại theo KM. "
+             f"Thêm hóa đơn xăng rồi tạo lại.")
+    gas_lines[-1]["is_last"] = True
+
+    R.tien_ks = sum(h["thanh_toan"] for h in hotel_lines)
+    pd_days = sum(t.so_dem for t in trips)
+    R.tien_pd = pd_days * L.pd_rate
+    R.tong_cp = R.tien_di_lai + R.tien_ks + R.tien_pd
+    R.thu_chi_them = R.tong_cp - cfg.tam_ung
+    R.tong_hd = sum(g["thanh_toan"] for g in gas_lines)
+    R.khop = abs(R.tong_hd - R.tien_di_lai) < 1
+
+    pd_line = {"so_hd": "AP4", "loai_hd": None, "mota": "Per-diem",
+               "chua_vat": R.tien_pd, "vat": 0, "thanh_toan": R.tien_pd,
+               "web": "", "ma_tra_cuu": "", "mst_ban": "", "trip_idx": None, "is_last": False}
+    all_lines = gas_lines + hotel_lines + [pd_line]
+    if len(all_lines) > L.dntt_inv_slots:
+        err(f"{len(all_lines)} dòng hóa đơn nhưng mẫu DNTT chỉ {L.dntt_inv_slots} dòng. "
+            f"Bớt hóa đơn hoặc dùng mẫu có nhiều dòng hơn.")
+        return R
+    R.invoices = all_lines
+
+    # hotel theo chuyến (cho bảng claim)
+    per_trip_hotel = {}
+    for h in hotel_lines:
+        per_trip_hotel[h["trip_idx"]] = per_trip_hotel.get(h["trip_idx"], 0) + h["thanh_toan"]
+
+    if not khu_vuc:
+        khu_vuc = trips[0].dia_diem
+    try:
+        R.xlsx_bytes = _fill_multi(wb, L, cfg, trips, all_lines, per_trip_hotel, khu_vuc)
+    except Exception as ex:
+        import traceback
+        err(f"Lỗi khi điền Excel: {ex}\n{traceback.format_exc()[-500:]}")
+        return R
+
+    nm = _strip_diacritics(L.requestor) or "CS"
+    R.out_filename = f"CS {nm} - {MON[cfg.month]} {cfg.year}.xlsx"
+    R.ok = True
+    return R
+
+
+def _fill_multi(wb, L, cfg, trips, lines, per_trip_hotel, khu_vuc) -> bytes:
+    dn = wb["DNTT"]
+    dn["G3"] = f"Thời gian/ Time: {cfg.thang_label}"
+    dn[f"C{L.dntt_desc_row0}"] = f"Công tác phí {khu_vuc} tháng {cfg.thang_label}"
+
+    # xóa vùng hóa đơn cũ
+    for r in range(L.dntt_inv_row0, L.dntt_sum_row):
+        for col in ("A", "B", "F", "G", "H", "I", "J"):
+            dn[f"{col}{r}"].value = None
+            dn[f"{col}{r}"].hyperlink = None
+    proj = str(dn[f"B{L.dntt_desc_row0}"].value or "").strip()
+    for i, ln in enumerate(lines):
+        r = L.dntt_inv_row0 + i
+        dn[f"A{r}"] = i + 1
+        if i == 0 and proj:
+            dn[f"D{r}"] = proj
+        dn[f"B{r}"] = ln["mota"]
+        dn[f"F{r}"] = cfg.thang_label
+        dn[f"G{r}"] = ln["chua_vat"]
+        dn[f"H{r}"] = ln["vat"]
+        dn[f"I{r}"] = ln["thanh_toan"]
+        dn[f"J{r}"] = ln["so_hd"]
+
+    # --- Bảng kê chi tiết ---
+    bk = wb[L.bk_sheet]
+    bk[L.bk_h3] = f"Thời gian/ Time: {cfg.month:02d}/{cfg.year}"
+    if cfg.muc_dich:
+        bk[L.bk_muc_dich_cell] = cfg.muc_dich
+
+    for i in range(L.bk_trip_slots):
+        r = L.bk_trip_row0 + i
+        if i < len(trips):
+            t = trips[i]
+            bk[f"C{r}"] = t.dia_diem
+            bk[f"D{r}"] = t.range_str
+            bk[f"E{r}"] = t.so_dem
+        else:
+            bk[f"C{r}"] = None
+            bk[f"D{r}"] = None
+            bk[f"E{r}"] = 0
+
+    for i in range(L.bk_claim_slots):
+        r = L.bk_claim_row0 + i
+        if i < len(trips):
+            bk[f"D{r}"] = round(trips[i].km)
+            hv = per_trip_hotel.get(i)
+            bk[f"F{r}"] = hv if hv else None
+        else:
+            bk[f"D{r}"] = None
+            bk[f"F{r}"] = None
+
+    bk[L.bk_tam_ung_cell] = cfg.tam_ung if cfg.tam_ung else None
+
+    # --- Tra cứu HĐ ---
+    tc = wb[L.tc_sheet]
+    for r in range(L.tc_row0, L.tc_row0 + 40):
+        for col in ("B", "C", "D", "E"):
+            tc[f"{col}{r}"].value = None
+            tc[f"{col}{r}"].hyperlink = None
+    r = L.tc_row0
+    for ln in lines:
+        if not ln["loai_hd"]:
+            continue
+        tc[f"B{r}"] = ln["loai_hd"]
+        tc[f"C{r}"] = ln["web"]
+        tc[f"D{r}"] = ln["ma_tra_cuu"]
+        tc[f"E{r}"] = ln["mst_ban"] or ln["so_hd"]
+        r += 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
     return buf.getvalue()
