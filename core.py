@@ -547,7 +547,7 @@ def generate(template_bytes: bytes,
     else:
         R.thieu = can_co - goc_last
         warn(f"THIẾU HÓA ĐƠN: còn thiếu {R.thieu:,.0f} đồng so với tiền đi lại theo KM. "
-             f"Bổ sung thêm hóa đơn rồi tạo lại. (Bót KHÔNG bịa tăng hóa đơn cuối.)")
+             f"Bổ sung thêm hóa đơn rồi tạo lại. (BOT KHÔNG bịa tăng hóa đơn cuối.)")
 
     for j, r in enumerate(rows):
         r["is_last"] = (j == len(rows) - 1)
@@ -574,4 +574,17 @@ def build_renamed_zip(invoice_files: list, renamed: list) -> bytes:
         for old, new in renamed:
             if old in by_name:
                 z.writestr(new, by_name[old])
+    return buf.getvalue()
+
+
+def build_full_zip(result: "Result", invoice_files: list) -> bytes:
+    """1 file zip chứa TẤT CẢ: file Excel công tác phí + các hóa đơn đã đổi tên."""
+    by_name = {n: b for n, b in invoice_files}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if result.xlsx_bytes:
+            z.writestr(result.out_filename, result.xlsx_bytes)
+        for old, new in result.renamed:
+            if old in by_name:
+                z.writestr(f"Hóa đơn/{new}", by_name[old])
     return buf.getvalue()

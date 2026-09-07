@@ -10,7 +10,7 @@ Tự tạo file Excel công tác phí hàng tháng từ hóa đơn xăng. Thiế
 5. Bấm **Tạo file công tác phí** → tải file `.xlsx` + file zip hóa đơn đã đổi tên.
 6. Mở file Excel bằng Excel/Numbers 1 lần cho công thức tự tính lại.
 
-## Bót làm gì
+## BOT làm gì
 - Đọc từng PDF: số hóa đơn, số tiền ("Tổng cộng tiền thanh toán"), VAT, mã tra cứu,
   website, loại hàng (Xăng→HĐX / Dầu→HĐD), địa chỉ người mua.
 - Đổi tên file → `HĐX_<số>` / `HĐD_<số>`; địa chỉ sai → gắn nhãn `[SAI ĐỊA CHỈ]`.
