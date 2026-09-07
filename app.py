@@ -86,8 +86,7 @@ tu_ngay = c2.date_input("Kỳ — Từ ngày", value=today.replace(day=21) - dt.
                         format="DD/MM/YYYY")
 den_ngay = c3.date_input("Kỳ — Đến ngày", value=today.replace(day=20), format="DD/MM/YYYY")
 
-dia_diem = st.text_input("Địa điểm công tác",
-                         placeholder="Phường Hạc Thành - Sầm Sơn - Bỉm Sơn - Xã Triệu Sơn")
+dia_diem = st.text_input("Địa điểm công tác")
 muc_dich = st.text_input("Mục đích công tác (tùy chọn)")
 
 c4, c5, c6 = st.columns(3)
