@@ -123,12 +123,17 @@ def tidy_url(u):
     return u
 
 
+def _strip_diacritics(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s or "")
+                   if unicodedata.category(c) != "Mn").replace("đ", "d").replace("Đ", "D")
+
+
 def norm_addr(s):
-    s = unicodedata.normalize("NFC", s or "").lower().strip()
+    s = _strip_diacritics(unicodedata.normalize("NFC", s or "")).lower().strip()
     s = s.replace("–", "-").replace("—", "-")
     s = re.sub(r"\s*-\s*", "-", s)
-    s = re.sub(r"tp\.?\s*hồ chí minh|thành phố hồ chí minh|tp\s*hcm|tphcm|hcmc", "hcm", s)
-    s = re.sub(r"\bsố\b", " ", s)
+    s = re.sub(r"tp\.?\s*ho chi minh|thanh pho ho chi minh|tp\s*hcm|tphcm|hcmc", "hcm", s)
+    s = re.sub(r"\bso\b", " ", s)
     s = s.replace(".", " ").replace(",", " ")
     return re.sub(r"\s+", " ", s).strip()
 
@@ -143,6 +148,62 @@ def _pdf_text(pdf_bytes: bytes) -> str:
         return ""
 
 
+def _pdf_first_image(pdf_bytes: bytes):
+    try:
+        from pypdf import PdfReader
+        for p in PdfReader(io.BytesIO(pdf_bytes)).pages:
+            for im in (p.images or []):
+                return im.data
+    except Exception:
+        pass
+    return None
+
+
+def ocr_text(pdf_bytes: bytes) -> str:
+    """OCR trang hóa đơn dạng ẢNH (Petrolimex). '' nếu không cài được tesseract."""
+    ib = _pdf_first_image(pdf_bytes)
+    if not ib:
+        return ""
+    try:
+        import pytesseract
+        from PIL import Image, ImageOps
+    except Exception:
+        return ""
+    try:
+        im = Image.open(io.BytesIO(ib)).convert("L")
+        w, h = im.size
+        k = 3000 / max(w, h)
+        if k > 1:
+            im = im.resize((int(w * k), int(h * k)), Image.LANCZOS)
+        im = ImageOps.autocontrast(im, cutoff=1)          # xám tương phản, KHÔNG nhị phân cứng
+        for lang in ("vie+eng", "eng"):
+            try:
+                return pytesseract.image_to_string(im, lang=lang)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+def _ocr_gas_fields(raw: str) -> dict:
+    """Rút số tiền + ngày từ chữ OCR của hóa đơn xăng ảnh (chữ hay bị lỗi chính tả)."""
+    import collections
+    flat = re.sub(r"\s+", " ", raw or "")
+    d = {"so_tien": None, "ngay": None}
+    m = re.search(r"Ngày\s*(\d{1,2})\s*th[áaà]ng\s*(\d{1,2})\s*năm\s*(\d{4})", flat)
+    if m:
+        try:
+            d["ngay"] = dt.date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    toks = [int(re.sub(r"\D", "", x)) for x in re.findall(r"\b\d{1,3}(?:[.\s]\d{3})+\b", flat)]
+    toks = [v for v in toks if 30_000 <= v <= 20_000_000]
+    if toks:
+        d["so_tien"] = collections.Counter(toks).most_common(1)[0][0]
+    return d
+
+
 def extract_invoice(pdf_bytes: bytes, buyer=None) -> dict:
     buyer = buyer or {}
     ten_mua = buyer.get("ten", TEN_NGUOI_MUA)
@@ -152,9 +213,15 @@ def extract_invoice(pdf_bytes: bytes, buyer=None) -> dict:
     t = collapse(_pdf_text(pdf_bytes))
     d = {"so_hd": None, "so_tien": None, "vat": 0, "web": "", "ma_tra_cuu": "",
          "mst_ban": "", "dia_chi_mua": "", "dia_chi_ok": False, "ngay": None,
-         "loai": "X", "is_hotel": False, "so_dem": None}
+         "loai": "X", "is_hotel": False, "so_dem": None, "from_ocr": False}
     if not t:
-        return d
+        raw = ocr_text(pdf_bytes)          # PDF ảnh (Petrolimex) -> thử OCR
+        t = collapse(raw)
+        if not t:
+            return d
+        d["from_ocr"] = True
+        og = _ocr_gas_fields(raw)
+        d["so_tien"], d["ngay"] = og["so_tien"], og["ngay"]
 
     # ----- khách sạn / nhà nghỉ? -----
     if re.search(r"thuê\s*phòng|phòng\s*nghỉ|lưu\s*trú|khách\s*sạn|nhà\s*nghỉ|homestay|motel|hotel",
@@ -175,7 +242,7 @@ def extract_invoice(pdf_bytes: bytes, buyer=None) -> dict:
          or re.search(r"[Ww]ebsite tra cứu[^:]*:\s*(https?://[^\s,)]+|[a-z0-9.\-]+\.vn)", t))
     if m:
         d["web"] = tidy_url(m.group(1))
-    m = re.search(r"[Mm]ã tra cứu[^:]*:\s*([A-Za-z0-9_\-]+)", t)
+    m = re.search(r"[Mm]ã tra cứu[^:]*:\s*([A-Za-z0-9_\-*]+)", t)
     if m:
         d["ma_tra_cuu"] = m.group(1)
 
@@ -220,9 +287,10 @@ def extract_invoice(pdf_bytes: bytes, buyer=None) -> dict:
     m = re.search(r"(Tầng\s*\d+[^\n]{5,120}?(?:Việt\s*Nam|Vietnam)\.?)", t, re.I)
     if m:
         d["dia_chi_mua"] = collapse(m.group(1))
+    tnd = _strip_diacritics(t).lower()          # bỏ dấu để chịu được lỗi OCR
+    ten_ok = _strip_diacritics(ten_mua).lower() in tnd
     d["dia_chi_ok"] = (
-        ten_mua.lower() in t.lower()
-        and mst_mua in t
+        ten_ok and mst_mua in t
         and bool(d["dia_chi_mua"])
         and norm_addr(d["dia_chi_mua"]) == norm_addr(dc_chuan)
     )
@@ -641,11 +709,6 @@ def build_full_zip(result: "Result", invoice_files: list) -> bytes:
 # ===================  CHẾ ĐỘ NHIỀU CHUYẾN / CÓ LƯU TRÚ  ======================
 # ============================================================================
 
-def _strip_diacritics(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFD", s or "")
-                   if unicodedata.category(c) != "Mn").replace("đ", "d").replace("Đ", "D")
-
-
 @dataclass
 class Trip:
     dia_diem: str
@@ -779,6 +842,81 @@ def _match_hotel_trip(ngay, trips):
     return overnight[0][0]
 
 
+def _match_any_trip(ngay, trips):
+    """Khớp 1 ngày với chuyến bất kỳ (kể cả chuyến đi trong ngày). Trả index 0-based."""
+    if not trips:
+        return 0
+    if ngay:
+        inside = [i for i, t in enumerate(trips)
+                  if t.tu - dt.timedelta(days=1) <= ngay <= t.den + dt.timedelta(days=1)]
+        if inside:
+            return min(inside, key=lambda i: (trips[i].den - trips[i].tu).days)
+        return min(range(len(trips)),
+                   key=lambda i: min(abs((ngay - trips[i].tu).days),
+                                     abs((ngay - trips[i].den).days)))
+    return 0
+
+
+def _norm_ma(s):
+    return re.sub(r"[^A-Za-z0-9]", "", str(s or "")).upper()
+
+
+def prefill_gas_rows(invoice_files: list, trips: list) -> list:
+    """Đọc hóa đơn xăng (OCR ảnh Petrolimex hoặc PDF chữ) + EML → gợi ý sẵn bảng
+    'Số tiền hóa đơn xăng': [{so_hd, so_tien, chuyen}]. Người dùng chỉ soát lại."""
+    pdfs = [(n, b) for n, b in invoice_files if n.lower().endswith(".pdf")]
+    emls = [(n, b) for n, b in invoice_files if n.lower().endswith(".eml")]
+
+    # PDF: tách hóa đơn KS (không phải xăng) ra
+    gas_pdfs, hotel_nos = [], set()
+    for name, b in pdfs:
+        try:
+            inv = extract_invoice(b, None)
+        except Exception:
+            continue
+        if inv.get("is_hotel"):
+            if inv.get("so_hd"):
+                hotel_nos.add(inv["so_hd"].lstrip("0") or inv["so_hd"])
+            continue
+        gas_pdfs.append((name, inv))
+
+    eml_by_ma, eml_gas_nos = {}, []
+    for name, b in emls:
+        info = eml_info(b)
+        so = (info.get("so_hd") or "").strip()
+        ma = _norm_ma(info.get("ma_tra_cuu"))
+        if not so:
+            continue
+        if info.get("is_hotel") or (so.lstrip("0") or so) in hotel_nos:
+            continue
+        eml_gas_nos.append(so)
+        if ma:
+            eml_by_ma[ma] = so
+
+    rows, seen = [], set()
+    for name, inv in gas_pdfs:
+        ma = _norm_ma(inv.get("ma_tra_cuu"))
+        so = (eml_by_ma.get(ma) if ma else None) or inv.get("so_hd") \
+            or (re.sub(r"\D", "", name) or None)
+        if not so or so in seen:
+            continue
+        seen.add(so)
+        ti = _match_any_trip(inv.get("ngay"), trips)
+        rows.append({"so_hd": so, "so_tien": inv.get("so_tien"),
+                     "chuyen": ti + 1, "_ngay": inv.get("ngay")})
+
+    # EML xăng có mà không thấy PDF → vẫn đưa vào để người dùng gõ số tiền
+    for so in eml_gas_nos:
+        if so not in seen:
+            seen.add(so)
+            rows.append({"so_hd": so, "so_tien": None, "chuyen": 1, "_ngay": None})
+
+    rows.sort(key=lambda r: (r.get("_ngay") or dt.date(2100, 1, 1), r["so_hd"]))
+    for r in rows:
+        r.pop("_ngay", None)
+    return rows
+
+
 def generate_multi(template_bytes: bytes,
                    invoice_files: list,
                    cfg: Config,
@@ -812,22 +950,32 @@ def generate_multi(template_bytes: bytes,
     pdfs = [(n, b) for n, b in invoice_files if n.lower().endswith(".pdf")]
     emls = [(n, b) for n, b in invoice_files if n.lower().endswith(".eml")]
     pdf_by_no = {}       # so_hd(lstrip0) -> info
+    pdf_by_ma = {}       # norm(mã tra cứu) -> info  (hóa đơn xăng ảnh không có số HĐ)
     for name, b in pdfs:
         inv = extract_invoice(b, cfg.buyer)
         so = inv["so_hd"]
+        ma = _norm_ma(inv.get("ma_tra_cuu"))
+        pre = "HĐKS" if inv["is_hotel"] else ("HĐD" if inv["loai"] == "D" else "HĐX")
+        mark = "" if inv["dia_chi_ok"] else " [SAI ĐỊA CHỈ]"
+        if ma:
+            pdf_by_ma[ma] = inv
         if so:
             pdf_by_no[so.lstrip("0") or so] = inv
-            pre = "HĐKS" if inv["is_hotel"] else ("HĐD" if inv["loai"] == "D" else "HĐX")
-            mark = "" if inv["dia_chi_ok"] else " [SAI ĐỊA CHỈ]"
             R.renamed.append((name, f"{pre}_{so}{mark}.pdf"))
-            if not inv["dia_chi_ok"]:
-                warn(f"HĐ {so}: địa chỉ người mua chưa khớp — thấy “{inv['dia_chi_mua'] or 'không tìm thấy'}”.")
+        elif ma:
+            R.renamed.append((name, f"{pre}_{ma}{mark}.pdf"))
+        if not inv["is_hotel"] and not inv["dia_chi_ok"] and inv.get("dia_chi_mua"):
+            warn(f"HĐ {so or ma}: địa chỉ người mua chưa khớp — thấy “{inv['dia_chi_mua']}”.")
     eml_by_no = {}
+    eml_ma2no = {}      # norm(mã tra cứu) -> so_hd
     for name, b in emls:
         info = eml_info(b)
         so = (info.get("so_hd") or "").lstrip("0")
+        ma = _norm_ma(info.get("ma_tra_cuu"))
         if so:
             eml_by_no[so] = info
+            if ma:
+                eml_ma2no[ma] = so
 
     # --- KHÁCH SẠN: từ PDF, tự khớp chuyến ---
     hotel_lines = []
@@ -850,23 +998,33 @@ def generate_multi(template_bytes: bytes,
         warn("Không thấy hóa đơn khách sạn nào trong file upload.")
     hotel_lines.sort(key=lambda h: h["trip_idx"])
 
-    # --- XĂNG: từ bảng user nhập ---
+    # --- XĂNG: bảng OCR gợi ý (người dùng đã soát); số tiền trống -> lấy lại từ OCR ---
     gas_lines = []
     for g in gas_rows:
         so = re.sub(r"\D", "", str(g.get("so_hd") or ""))
-        tien = parse_money(g.get("so_tien"))
-        if not so or tien is None:
+        if not so:
             continue
+        key = so.lstrip("0") or so
+        eml = eml_by_no.get(key)
+        pdf = pdf_by_no.get(key)
+        if pdf is None and eml and _norm_ma(eml.get("ma_tra_cuu")):
+            pdf = pdf_by_ma.get(_norm_ma(eml.get("ma_tra_cuu")))
+        if pdf and pdf.get("is_hotel"):
+            continue        # hóa đơn KS lọt vào bảng xăng -> bỏ (đã tính ở hotel_lines)
+        tien = parse_money(g.get("so_tien"))
+        if tien is None and pdf:
+            tien = pdf.get("so_tien")
+        if tien is None:
+            warn(f"HĐ xăng {so}: chưa có số tiền (OCR không đọc được) — nhập tay rồi tạo lại.")
+            continue
+        tien = int(round(tien))
         ch = g.get("chuyen")
         try:
             ti = int(ch) - 1
         except (TypeError, ValueError):
             ti = None
         if ti is None or not (0 <= ti < len(trips)):
-            ti = len(gas_lines) % len(trips)     # rải đều nếu không ghi chuyến
-        key = so.lstrip("0") or so
-        pdf = pdf_by_no.get(key)
-        eml = eml_by_no.get(key)
+            ti = _match_any_trip(pdf.get("ngay") if pdf else None, trips)
         web = (pdf and pdf["web"]) or (eml and eml.get("web")) or ""
         ma = (pdf and pdf["ma_tra_cuu"]) or (eml and eml.get("ma_tra_cuu")) or ""
         mst = (pdf and pdf["mst_ban"]) or ""
@@ -881,7 +1039,8 @@ def generate_multi(template_bytes: bytes,
             "trip_idx": ti, "is_last": False,
         })
     if not gas_lines:
-        err("Chưa nhập hóa đơn xăng nào (bảng 'Số tiền hóa đơn xăng').")
+        err("Không có hóa đơn xăng nào đọc được. Upload PDF + EML hóa đơn xăng, "
+            "hoặc điền tay bảng 'Số tiền hóa đơn xăng'.")
         return R
     gas_lines.sort(key=lambda x: (x["trip_idx"], x["so_hd"]))
 

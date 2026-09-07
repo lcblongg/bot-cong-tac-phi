@@ -32,8 +32,9 @@ with st.expander("📖  HƯỚNG DẪN SỬ DỤNG  —  bấm để mở", expa
 → nhập tổng KM (hoặc upload file Numbers) → upload file Excel mẫu tháng trước → bấm tạo.
 
 **Chế độ có lưu trú / nhiều chuyến**: nhập **bảng chuyến** (địa điểm · từ–đến ngày ·
-số đêm · KM mỗi chuyến) → upload tất cả hóa đơn (xăng + khách sạn) → nhập **bảng số tiền
-hóa đơn xăng** (gõ tay, vì hóa đơn Petrolimex là ảnh) → upload file Excel mẫu → bấm tạo.
+số đêm · KM mỗi chuyến) → upload tất cả hóa đơn (xăng + khách sạn) → BOT **tự đọc số tiền
+hóa đơn xăng** (kể cả hóa đơn Petrolimex dạng ảnh), chỉ cần soát lại → upload file Excel
+mẫu → bấm tạo.
 
 BOT lo phần còn lại: phân loại HĐX/HĐKS, đọc tiền khách sạn từ PDF, ghép hóa đơn ↔ chuyến,
 chia tỷ lệ mileage, dòng Per-diem, điền DNTT + Bảng kê + Tra cứu HĐ, đọc số thành chữ,
@@ -99,16 +100,43 @@ if MULTI:
         },
     )
 
+    # trips tạm (để gợi ý chuyến cho bảng xăng)
+    trips_now = []
+    for row in (trips_df or []):
+        _dd = str(row.get("Địa điểm") or "").strip()
+        _tu = core.parse_date(row.get("Từ ngày"))
+        _den = core.parse_date(row.get("Đến ngày"))
+        if not _dd and not _tu:
+            continue
+        trips_now.append(core.Trip(_dd, _tu, _den,
+                                   int(row.get("Số đêm") or 0),
+                                   float(row.get("Tổng KM") or 0)))
+
     st.subheader("3 · Hóa đơn (xăng + khách sạn)")
     inv_files = st.file_uploader("Kéo-thả tất cả .pdf và .eml của kỳ (cả xăng lẫn khách sạn)",
                                  type=["pdf", "eml"], accept_multiple_files=True)
 
-    st.subheader("4 · Số tiền hóa đơn xăng")
-    st.caption("Hóa đơn xăng Petrolimex là ảnh nên phải gõ tay. "
+    st.subheader("4 · Số tiền hóa đơn xăng — BOT tự đọc, soát lại nếu sai")
+    st.caption("BOT tự đọc số tiền + ngày từ hóa đơn xăng (kể cả Petrolimex dạng ảnh) và "
+               "đoán 'Chuyến'. Sai thì sửa thẳng trong bảng. "
                "Cột 'Chuyến' = số thứ tự dòng ở bảng chuyến (1, 2, 3…).")
+    _gas_default = [{"Số hóa đơn": "", "Số tiền": None, "Chuyến": 1}]
+    if inv_files:
+        sig = (tuple(sorted((f.name, f.size) for f in inv_files))
+               + tuple((str(t.tu), str(t.den)) for t in trips_now))
+        if st.session_state.get("gas_seed_sig") != sig:
+            with st.spinner("Đang đọc hóa đơn xăng (OCR)…"):
+                _pf = core.prefill_gas_rows(
+                    [(f.name, f.getvalue()) for f in inv_files], trips_now)
+            st.session_state["gas_seed"] = [
+                {"Số hóa đơn": r["so_hd"], "Số tiền": r["so_tien"], "Chuyến": r["chuyen"]}
+                for r in _pf] or _gas_default
+            st.session_state["gas_seed_sig"] = sig
+        _gas_default = st.session_state.get("gas_seed", _gas_default)
     gas_df = st.data_editor(
-        [{"Số hóa đơn": "", "Số tiền": None, "Chuyến": 1}],
-        num_rows="dynamic", width='stretch', key="gas",
+        _gas_default,
+        num_rows="dynamic", width='stretch',
+        key=f"gas_{hash(st.session_state.get('gas_seed_sig'))}",
         column_config={
             "Số tiền": st.column_config.NumberColumn(min_value=0, step=1000),
             "Chuyến": st.column_config.NumberColumn(min_value=1, step=1),
