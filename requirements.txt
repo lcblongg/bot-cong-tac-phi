@@ -1,0 +1,4 @@
+streamlit>=1.40
+openpyxl>=3.1
+pypdf>=4.0
+numbers-parser>=4.15
